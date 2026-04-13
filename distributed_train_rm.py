@@ -4,10 +4,26 @@ from typing import Optional
 
 import torch
 from datasets import load_from_disk
+from torch.distributed import init_process_group, destroy_process_group
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import get_total_norm, clip_grad_norm_
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from transformers import GPT2Tokenizer, GPT2ForSequenceClassification
 from tqdm import tqdm
+
+
+def ddp_setup(rank: int, world_size: int):
+   """
+   Args:
+       rank: Unique identifier of each process
+      world_size: Total number of processes
+   """
+   os.environ["MASTER_ADDR"] = "localhost"
+   os.environ["MASTER_PORT"] = "12355"
+   torch.cuda.set_device(rank)
+   init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 
 def collate_wrapper(tokenizer, device):
@@ -41,7 +57,8 @@ class Trainer:
             n_iterations: Optional[int],
             lr: float,
             weight_decay: float,
-            scheduler_hparams: dict,
+            milestones: list,
+            gamma: float,
             dataloader_hparams: dict,
             clip_grad_val: float=float('inf'),
             max_norm: float=10,
@@ -55,16 +72,20 @@ class Trainer:
 
         self.n_iterations = n_iterations
         self.rank = rank
-        self.reward_model = GPT2ForSequenceClassification.from_pretrained('/home/logsumexp/workspace/rl-summarizer/artifacts/sft/Mar31_07-34-36_lr=3e-05_weight_decay=0_clip_grad_val=inf')
-        self.reward_model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.reward_model.to(self.rank)
+        reward_model = GPT2ForSequenceClassification \
+                .from_pretrained('/home/logsumexp/workspace/rl-summarizer/artifacts/sft/Mar31_07-34-36_lr=3e-05_weight_decay=0_clip_grad_val=inf') \
+                .to(rank)
+
+        print(f"Model is assigned to rank {rank}")
+        reward_model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.reward_model = DDP(reward_model, device_ids=[rank])
 
         self.optimizer = torch.optim.Adam(
             self.reward_model.parameters(),
             lr=lr,
             weight_decay=weight_decay
         )
-        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, **scheduler_hparams)
+        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=milestones, gamma=gamma)
 
         comparison_dataset_train = load_from_disk("datasets/comparison/train_preprocessed")
         comparison_dataset_val = load_from_disk("datasets/comparison/val_preprocessed")
@@ -73,10 +94,12 @@ class Trainer:
 
         self.rm_train_dl = torch.utils.data.DataLoader(
             comparison_dataset_train, collate_fn=collate_fn,
+            sampler=DistributedSampler(comparison_dataset_train),
             **dataloader_hparams
         )
         self.rm_val_dl = torch.utils.data.DataLoader(
             comparison_dataset_val, collate_fn=collate_fn,
+            sampler=DistributedSampler(comparison_dataset_val),
             **dataloader_hparams
         )
 
@@ -84,7 +107,10 @@ class Trainer:
 
         current_time = datetime.now().strftime("%b%d_%H-%M-%S")
         self.model_name = f"rm/{current_time}_lr={lr}_weight_decay={weight_decay}_clip_grad_val={clip_grad_val}"
-        self.writer = SummaryWriter(log_dir=os.path.join("logs", self.model_name))
+        if self.rank == 0:
+            self.writer = SummaryWriter(log_dir=os.path.join("logs", self.model_name))
+        else:
+            self.writer = None
 
         self.clip_grad_val = clip_grad_val
         self.max_norm = max_norm
@@ -95,17 +121,22 @@ class Trainer:
 
         with torch.autograd.grad_mode.inference_mode(mode=do_not_need_grad):
             winner_logits = self.reward_model(**sample_winner_inputs).logits[:, 1]
-            loser_logits  = self.reward_model(**sample_loser_inputs).logits[:, 1]
+            loser_logits = self.reward_model(**sample_loser_inputs).logits[:, 1]
 
         return -self.logsigmoid(winner_logits - loser_logits).mean()
 
 
     def train_iteration(self, iteration_number: int):
         self.reward_model.train()
-        for train_batch in tqdm(self.rm_train_dl, desc=f"Training iteration {iteration_number}"):
+        self.rm_train_dl.sampler.set_epoch(iteration_number)
+
+        for train_batch in tqdm(self.rm_train_dl, desc=f"Training iteration {iteration_number}", disable=self.rank != 0):
             self.training_step += 1
+            cur_training_step = self.training_step
             training_loss = self.compute_loss(batch=train_batch)
-            self.writer.add_scalar(tag="loss/train", scalar_value=training_loss, global_step=self.training_step)
+
+            if self.rank == 0 and self.writer is not None:
+                self.writer.add_scalar(tag="loss/train", scalar_value=training_loss, global_step=cur_training_step)
 
             training_loss.backward()
 
@@ -114,21 +145,23 @@ class Trainer:
                     parameters=self.reward_model.parameters(),
                     error_if_nonfinite=True, max_norm=self.max_norm
                 )
-                self.writer.add_scalar(
-                    tag="grad_norm/before_clipping",
-                    scalar_value=grad_norm_before_clipping,
-                    global_step=self.training_step
-                )
+                if self.rank == 0 and self.writer is not None:
+                    self.writer.add_scalar(
+                        tag="grad_norm/before_clipping",
+                        scalar_value=grad_norm_before_clipping,
+                        global_step=cur_training_step
+                    )
 
             grad_norm_after_clipping = get_total_norm(
                 tensors=(p.grad for p in self.reward_model.parameters() if p.grad is not None),
                 error_if_nonfinite=True
             )
-            self.writer.add_scalar(
-                tag="grad_norm/after_clipping",
-                scalar_value=grad_norm_after_clipping,
-                global_step=self.training_step
-            )
+            if self.rank == 0 and self.writer is not None:
+                self.writer.add_scalar(
+                    tag="grad_norm/after_clipping",
+                    scalar_value=grad_norm_after_clipping,
+                    global_step=cur_training_step
+                )
 
             self.optimizer.step()
             self.optimizer.zero_grad()
@@ -137,25 +170,36 @@ class Trainer:
             self.reward_model.eval()
             validation_loss = 0
             num_validation_batches = 0
-            for val_batch in tqdm(self.rm_val_dl):
+            self.rm_val_dl.sampler.set_epoch(iteration_number)
+
+            for val_batch in tqdm(self.rm_val_dl, disable=self.rank != 0):
                 validation_loss += self.compute_loss(batch=val_batch, do_not_need_grad=True)
                 num_validation_batches += 1
 
-            self.writer.add_scalar(
-                tag="loss/val",
-                scalar_value=validation_loss / num_validation_batches,
-                global_step=iteration_number
+            if self.rank == 0 and self.writer is not None:
+                self.writer.add_scalar(
+                    tag="loss/val",
+                    scalar_value=validation_loss / num_validation_batches,
+                    global_step=iteration_number
+                )
+
+            self.reward_model.module.save_pretrained(
+                os.path.join("artifacts", self.model_name, f"epoch_{iteration_number}")
+            )
+            torch.save(
+                self.optimizer.state_dict(),
+                os.path.join("artifacts", self.model_name, f"epoch_{iteration_number}", "optimizer_state")
             )
 
-        self.writer.add_scalar(
-            tag="lr",
-            scalar_value=self.scheduler.get_last_lr()[0],
-            global_step=iteration_number
-        )
+        if self.rank == 0 and self.writer is not None:
+            self.writer.add_scalar(
+                tag="lr",
+                scalar_value=self.scheduler.get_last_lr()[0],
+                global_step=iteration_number
+            )
         self.scheduler.step()
 
     def train(self):
-        self.training_step = 0
         if isinstance(self.n_iterations, int):
             for iteration_number in range(self.n_iterations):
                 self.train_iteration(iteration_number=iteration_number)
@@ -165,26 +209,31 @@ class Trainer:
                 self.train_iteration(iteration_number=iteration_number)
                 iteration_number += 1
 
-        self.reward_model.save_pretrained(
-            os.path.join("artifacts", self.model_name)
-        )
+        if self.rank == 0:
+            self.reward_model.module.save_pretrained(
+                os.path.join("artifacts", self.model_name, "final")
+            )
+            torch.save(
+                self.optimizer.state_dict(),
+                os.path.join("artifacts", self.model_name, "final", "optimizer_state")
+            )
 
 def main(
-        rank: int, n_iterations: int | None, lr: float, weight_decay: float, milestones: list, gamma: float, batch_size: int,
-        num_workers: int, clip_grad_val: float, max_norm: float, eval_every: int
+        rank: int, world_size: int, n_iterations: int | None, lr: float, weight_decay: float,
+        milestones: list, gamma: float, batch_size: int, num_workers: int, clip_grad_val: float,
+        max_norm: float, eval_every: int
     ):
+    ddp_setup(rank=rank, world_size=world_size)
     trainer = Trainer(
         rank=rank,
         n_iterations=n_iterations,
         lr=lr,
         weight_decay=weight_decay,
-        scheduler_hparams={
-            "milestones": milestones,
-            "gamma": gamma
-        },
+        milestones=milestones,
+        gamma=gamma,
         dataloader_hparams={
             "batch_size": batch_size,
-            "shuffle": True,
+            "shuffle": False,
             "num_workers": num_workers
         },
         clip_grad_val=clip_grad_val,
@@ -192,23 +241,27 @@ def main(
         eval_every=eval_every
     )
     trainer.train()
+    destroy_process_group()
 
 if __name__ == "__main__":
 
-    rank = 1
     n_iterations = None
-    lr = 1e-5
+    lr = 3e-6
     weight_decay = 0.01
-    milestones=[2]
-    gamma=0.1
+    milestones = [2]
+    gamma = 0.1
     batch_size = 48
     num_workers = 0
     clip_grad_val = float("inf")
     max_norm = 10
-    eval_every = 1
+    eval_every = 2
 
-    main(
-        rank=rank, n_iterations=n_iterations, lr=lr, weight_decay=weight_decay,
-        milestones=milestones, gamma=gamma, batch_size=batch_size, num_workers=num_workers, clip_grad_val=clip_grad_val,
-        max_norm=max_norm, eval_every=eval_every
+    world_size = torch.cuda.device_count()
+    mp.spawn(
+        main, nprocs=world_size,
+        args=(
+            world_size, n_iterations, lr, weight_decay,
+            milestones, gamma, batch_size, num_workers, clip_grad_val,
+            max_norm, eval_every
+        )
     )
