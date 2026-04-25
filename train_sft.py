@@ -6,8 +6,10 @@ import torch
 from datasets import Dataset
 from torch.nn.utils import get_total_norm, clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import GPT2LMHeadModel
 from tqdm import tqdm
+
+from utils import get_tokenizer
 
 
 logsoftmax = torch.nn.LogSoftmax(dim=-1)
@@ -56,15 +58,13 @@ if __name__ == "__main__":
     WD = 0
     CLIP_GRAD_VAL = float("inf")
 
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    tokenizer.add_special_tokens({"pad_token": "<|endoftext|>"})
-    tokenizer.add_eos_token = True
+    tokenizer = get_tokenizer()
 
     model = GPT2LMHeadModel.from_pretrained('gpt2')
     model.to(DEVICE)
 
-    sft_train_dataset = Dataset.load_from_disk("datasets/sft/hf_dataset/train2").with_format("torch", columns=['input_ids', 'attention_mask', "summary_offset"], device=DEVICE, dtype=torch.int32)
-    sft_val_dataset = Dataset.load_from_disk("datasets/sft/hf_dataset/val2").with_format("torch", columns=['input_ids', 'attention_mask', "summary_offset"], device=DEVICE, dtype=torch.int32)
+    sft_train_dataset = Dataset.load_from_disk("datasets/sft/hf_dataset/train").with_format("torch", columns=['input_ids', 'attention_mask', "summary_offset"], device=DEVICE, dtype=torch.int32)
+    sft_val_dataset = Dataset.load_from_disk("datasets/sft/hf_dataset/train").with_format("torch", columns=['input_ids', 'attention_mask', "summary_offset"], device=DEVICE, dtype=torch.int32)
 
     sft_train_dl = torch.utils.data.DataLoader(sft_train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=collate_fn)
     sft_val_dl = torch.utils.data.DataLoader(sft_val_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=collate_fn)

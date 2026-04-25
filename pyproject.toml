@@ -17,8 +17,7 @@ dependencies = [
     "torch==2.8.0",
     "torchmetrics==1.9.0",
     "torchvision>=0.23.0",
-    "transformers==4.57.6",
-    "vllm>=0.11.0",
+    "transformers==5.3.0",
 ]
 
 [[tool.uv.index]]
