@@ -18,6 +18,7 @@ class SamplingOutput:
 
 
 softmax = nn.Softmax(dim=-1)
+
 def sample(
         model, input_ids: torch.Tensor, attention_mask: torch.Tensor,
         top_p: float, temperature: float, max_new_tokens: int, eos_id: int,

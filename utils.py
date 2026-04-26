@@ -17,7 +17,15 @@ def tensor_stats(tensor: torch.Tensor):
     return tensor.min(), tensor.max(),  tensor.mean(), tensor.std()
 
 
-def compute_grpo_loss(rewards: torch.Tensor, cur_probas: torch.Tensor, old_probas: torch.Tensor, reference_probas: torch.Tensor, mask: torch.Tensor, eps: float, beta: float=1):
+def compute_grpo_loss(
+        rewards: torch.Tensor,
+        cur_probas: torch.Tensor,
+        old_probas: torch.Tensor,
+        reference_probas: torch.Tensor,
+        mask: torch.Tensor,
+        eps: float,
+        beta: float=1
+    ):
     """
     rewards = (batch_size, group_size)
     cur_probas: (batch_size, group_size, seq_len)

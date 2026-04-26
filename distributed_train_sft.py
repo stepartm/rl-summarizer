@@ -10,8 +10,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import get_total_norm, clip_grad_norm_
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from transformers import GPT2Tokenizer, GPT2ForSequenceClassification
+from transformers import GPT2LMHeadModel
 from tqdm import tqdm
+
+from utils import get_tokenizer
 
 
 def ddp_setup(rank: int, world_size: int):
@@ -26,27 +28,19 @@ def ddp_setup(rank: int, world_size: int):
    init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 
-def collate_wrapper(tokenizer, device):
-    def collate_(batch):
-        winner_inputs = tokenizer(
-            [_['winner'] for _ in batch], padding=True, truncation=True,
-            return_tensors="pt", add_special_tokens=True, padding_side="left",
+def collate_wrapper(tokenizer):
+    def collate_fn(batch):
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            [_["input_ids"] for _ in batch], batch_first=True, padding_value=tokenizer.pad_token_id, padding_side='left'
         )
 
-        for k, v in winner_inputs.items():
-            winner_inputs[k] = v.to(device)
-
-        loser_inputs = tokenizer(
-            [_['loser'] for _ in batch], padding=True, truncation=True,
-            return_tensors="pt", add_special_tokens=True, padding_side="left",
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            [_["attention_mask"] for _ in batch], batch_first=True, padding_value=0,  padding_side='left'
         )
+        summary_offset = torch.tensor([_["summary_offset"] for _ in batch])
+        return input_ids, attention_mask, summary_offset
 
-        for k, v in loser_inputs.items():
-            loser_inputs[k] = v.to(device)
-
-        return winner_inputs, loser_inputs
-
-    return collate_
+    return collate_fn
 
 
 class Trainer:
@@ -64,48 +58,61 @@ class Trainer:
             eval_every: int = 1
         ):
 
-        self.logsigmoid = torch.nn.LogSigmoid()
-        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        self.tokenizer.add_special_tokens({"pad_token": "<|endoftext|>"})
-        self.tokenizer.add_eos_token = True
+        self.logsoftmax = torch.nn.LogSoftmax(dim=-1)
+        self.tokenizer = get_tokenizer()
 
         self.n_iterations = n_iterations
         self.rank = rank
-        reward_model = GPT2ForSequenceClassification \
-                .from_pretrained('/home/logsumexp/workspace/rl-summarizer/artifacts/sft/Apr27_07-18-30_lr=3e-05_weight_decay=0_clip_grad_val=10/epoch_120') \
-                .to(rank)
+        model = GPT2LMHeadModel.from_pretrained('gpt2')
+        model.to(rank)
 
         print(f"Model is assigned to rank {rank}")
-        reward_model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.reward_model = DDP(reward_model, device_ids=[rank])
+        model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.model = DDP(model, device_ids=[rank])
 
         self.optimizer = torch.optim.Adam(
-            self.reward_model.parameters(),
+            self.model.parameters(),
             lr=lr,
             weight_decay=weight_decay
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=milestones, gamma=gamma)
 
-        comparison_dataset_train = load_from_disk("datasets/comparison/train_preprocessed")
-        comparison_dataset_val = load_from_disk("datasets/comparison/val_preprocessed")
+        dataset_train = (
+            load_from_disk("datasets/sft/hf_dataset/train")
+            .with_format(
+                "torch",
+                columns=['input_ids', 'attention_mask', "summary_offset"],
+                device=rank,
+                dtype=torch.int32
+            )
+        )
+        dataset_val = (
+            load_from_disk("datasets/sft/hf_dataset/train")
+            .with_format(
+                "torch",
+                columns=['input_ids', 'attention_mask', "summary_offset"],
+                device=rank,
+                dtype=torch.int32
+            )
+        )
 
-        collate_fn = collate_wrapper(tokenizer=self.tokenizer, device=self.rank)
+        collate_fn = collate_wrapper(tokenizer=self.tokenizer)
 
-        self.rm_train_dl = torch.utils.data.DataLoader(
-            comparison_dataset_train, collate_fn=collate_fn,
-            sampler=DistributedSampler(comparison_dataset_train),
+        self.train_dl = torch.utils.data.DataLoader(
+            dataset_train, collate_fn=collate_fn,
+            sampler=DistributedSampler(dataset_train),
             **dataloader_hparams
         )
-        self.rm_val_dl = torch.utils.data.DataLoader(
-            comparison_dataset_val, collate_fn=collate_fn,
-            sampler=DistributedSampler(comparison_dataset_val),
+        self.val_dl = torch.utils.data.DataLoader(
+            dataset_val, collate_fn=collate_fn,
+            sampler=DistributedSampler(dataset_val),
             **dataloader_hparams
         )
 
         self.training_step = 0
 
         current_time = datetime.now().strftime("%b%d_%H-%M-%S")
-        self.model_name = f"rm/{current_time}_lr={lr}_weight_decay={weight_decay}_clip_grad_val={max_norm}"
+        self.model_name = f"sft/{current_time}_lr={lr}_weight_decay={weight_decay}_clip_grad_val={max_norm}"
         if self.rank == 0:
             self.writer = SummaryWriter(log_dir=os.path.join("logs", self.model_name))
         else:
@@ -115,20 +122,35 @@ class Trainer:
         self.eval_every = eval_every
 
     def compute_loss(self, batch, do_not_need_grad=False):
-        sample_winner_inputs, sample_loser_inputs = batch
+        input_ids, attention_mask, summary_offset = batch
+        max_offset = torch.max(summary_offset)
 
         with torch.autograd.grad_mode.inference_mode(mode=do_not_need_grad):
-            winner_logits = self.reward_model(**sample_winner_inputs).logits[:, 1]
-            loser_logits = self.reward_model(**sample_loser_inputs).logits[:, 1]
+            res = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
 
-        return -self.logsigmoid(winner_logits - loser_logits).mean()
+        logits = res.logits[:, -max_offset-1:-1]
+        logprobas = self.logsoftmax(logits)
+        labels = input_ids[:, -max_offset:].unsqueeze(2)
+        label_logprobas = torch.gather(input=logprobas, dim=2, index=labels).squeeze()
+
+        labels_mask = torch.zeros_like(label_logprobas)
+
+        for i, offset in enumerate(summary_offset):
+            for j in range(offset):
+                labels_mask[i, - 1 - j] = 1
+
+        loss_per_sequence = - (label_logprobas * labels_mask).sum(dim=-1) / labels_mask.sum(dim=-1)
+        return loss_per_sequence.mean()
 
 
     def train_iteration(self, iteration_number: int):
-        self.reward_model.train()
-        self.rm_train_dl.sampler.set_epoch(iteration_number)
+        self.model.train()
+        self.train_dl.sampler.set_epoch(iteration_number)
 
-        for train_batch in tqdm(self.rm_train_dl, desc=f"Training iteration {iteration_number}", disable=self.rank != 0):
+        for train_batch in tqdm(self.train_dl, desc=f"Training iteration {iteration_number}", disable=self.rank != 0):
             self.training_step += 1
             cur_training_step = self.training_step
             training_loss = self.compute_loss(batch=train_batch)
@@ -140,7 +162,7 @@ class Trainer:
 
             if self.max_norm < float('inf'):
                 grad_norm_before_clipping = clip_grad_norm_(
-                    parameters=self.reward_model.parameters(),
+                    parameters=self.model.parameters(),
                     error_if_nonfinite=True, max_norm=self.max_norm
                 )
                 if self.rank == 0 and self.writer is not None:
@@ -151,7 +173,7 @@ class Trainer:
                     )
 
             grad_norm_after_clipping = get_total_norm(
-                tensors=(p.grad for p in self.reward_model.parameters() if p.grad is not None),
+                tensors=(p.grad for p in self.model.parameters() if p.grad is not None),
                 error_if_nonfinite=True
             )
             if self.rank == 0 and self.writer is not None:
@@ -165,12 +187,12 @@ class Trainer:
             self.optimizer.zero_grad()
 
         if iteration_number % self.eval_every == 0:
-            self.reward_model.eval()
+            self.model.eval()
             validation_loss = 0
             num_validation_batches = 0
-            self.rm_val_dl.sampler.set_epoch(iteration_number)
+            self.val_dl.sampler.set_epoch(iteration_number)
 
-            for val_batch in tqdm(self.rm_val_dl, disable=self.rank != 0):
+            for val_batch in tqdm(self.val_dl, disable=self.rank != 0):
                 validation_loss += self.compute_loss(batch=val_batch, do_not_need_grad=True)
                 num_validation_batches += 1
 
@@ -181,13 +203,13 @@ class Trainer:
                     global_step=iteration_number
                 )
 
-            self.reward_model.module.save_pretrained(
-                os.path.join("artifacts", self.model_name, f"epoch_{iteration_number}")
-            )
-            torch.save(
-                self.optimizer.state_dict(),
-                os.path.join("artifacts", self.model_name, f"epoch_{iteration_number}", "optimizer_state")
-            )
+                self.model.module.save_pretrained(
+                    os.path.join("artifacts", self.model_name, f"epoch_{iteration_number}")
+                )
+                torch.save(
+                    self.optimizer.state_dict(),
+                    os.path.join("artifacts", self.model_name, f"epoch_{iteration_number}", "optimizer_state")
+                )
 
         if self.rank == 0 and self.writer is not None:
             self.writer.add_scalar(
@@ -208,7 +230,7 @@ class Trainer:
                 iteration_number += 1
 
         if self.rank == 0:
-            self.reward_model.module.save_pretrained(
+            self.model.module.save_pretrained(
                 os.path.join("artifacts", self.model_name, "final")
             )
             torch.save(
@@ -243,11 +265,11 @@ def main(
 if __name__ == "__main__":
 
     n_iterations = None
-    lr = 3e-6
-    weight_decay = 0.01
-    milestones = [2]
+    lr = 3e-5
+    weight_decay = 0
+    milestones = [5]
     gamma = 0.1
-    batch_size = 48
+    batch_size = 64
     num_workers = 0
     max_norm = 10
     eval_every = 2
